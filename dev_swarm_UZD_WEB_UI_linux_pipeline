@@ -1,0 +1,156 @@
+def deploy_service ()
+{
+    int service_status = sh (
+        script: "docker service ps ${ServiceName}",
+        returnStatus: true)
+
+    if (service_status == 0) {
+        sh "docker service update --force --image=${NewImageTag}:${BUILD_NUMBER} ${ServiceName}"
+    } else {
+		sh """docker service create --replicas 1 \
+		--publish ${Port}:443 \
+		--restart-max-attempts 3 \
+		-e ASPNETCORE_URLS=\'https://+;http://+\' \
+		-e ASPNETCORE_Kestrel__Certificates__Default__Path=/app/${CertFileNameCluster} \
+		--mount type=bind,source=/etc/localtime,destination=/etc/localtime,ro \
+		--mount type=bind,source=/etc/timezone,destination=/etc/timezone,ro \
+		--name ${ServiceName} ${NewImageTag}:${BUILD_NUMBER}"""
+	}
+}
+
+pipeline {
+    agent none
+    options {
+        skipDefaultCheckout()
+        buildDiscarder(logRotator(numToKeepStr: '30', artifactNumToKeepStr: '30'))
+        timestamps()
+    }
+        
+    environment {
+        ASPENV='Debug'
+        ProjectName='ATB.RBS.UzdPortal.WebUi'
+		AppDll= "ATB.RBS.UZDStorePlus.WebUi.dll"
+        PathProjectForBuild="${ProjectName}/${ProjectName}.csproj"
+
+        ServiceName="pre-sw-uzd-ui-app"
+        Port="6339"
+		RepositoryPath="tt-docker-build.atbmarket.com:80"
+		NewImageTag="${RepositoryPath}/atb_eis/${ServiceName}"
+		RepositoryLogin="harbor_push"
+		RepositoryPass="harbor_push1A"
+		root_cert_name="atb_root_cert.crt"
+		CertFileNameCluster="tt-sw-t.pfx"
+		file_AppSettings = "src/${ProjectName}/appsettings.json" 
+    }
+        
+    stages {       
+        stage("Получение проекта с репозитория") {
+            agent {label "tt-docker-build"}
+			steps {
+				cleanWs()
+				checkout([$class: 'GitSCM', branches: [[name: '*/v2.6.2.x']], doGenerateSubmoduleConfigurations: false, extensions: [[$class: 'RelativeTargetDirectory', relativeTargetDir: 'src']], submoduleCfg: [], userRemoteConfigs: [[credentialsId: '0cb6c2ac-e6b8-49e7-77b6-69e4f306ce8q', 
+				url: 'http://rbs-app:7894/scm/uzd/rbs_uzdportal.git']]])
+				checkout([$class: 'GitSCM', branches: [[name: '*/master']], doGenerateSubmoduleConfigurations: false, extensions: [[$class: 'RelativeTargetDirectory', relativeTargetDir: 'certs']], submoduleCfg: [], userRemoteConfigs: [[credentialsId: '0cb6c2ac-e6b8-49e7-77b6-69e4f306ce8q', url: 'http://asuservice@rbs-app:7894/scm/eis/eis_ssl_certs.git']]])		 
+			}
+		}
+
+				stage ("Правка конфигурационного файла appsettings.json") {
+			agent {label "tt-docker-build"}
+			steps {	
+					withCredentials([usernamePassword(credentialsId: 'mobile-assistant-api', passwordVariable: 'userdbpass', usernameVariable: 'userdbname')])
+				{
+			
+				sh """#!/bin/bash
+				sed 's| //.*||' ${file_AppSettings} |
+				jq '
+
+				.AppSettings.ConnectionString = "Data Source=uzd-db-t02.atbmarket.com;Initial Catalog=UZD_autofix;user id=usernamedb;Trusted_Connection=false;TrustServerCertificate=true;password=userpassworddb;"	|
+				
+				.AppSettings.SignConnectionString = "Data Source=uzd-db-t02.atbmarket.com;Initial Catalog=UZD_autofix;user id=usernamedb;Trusted_Connection=false;TrustServerCertificate=true;password=userpassworddb;"	|
+				
+				.AppSettings.LogsConnectionString = "Data Source=uzd-db-t02.atbmarket.com;Initial Catalog=UZDLog_autofix;user id=usernamedb;password=userpassworddb;Trusted_Connection=false;TrustServerCertificate=True;"     |
+				
+				.AppSettings.ControlSystemConnectionString = "Data Source=uzd-db-t02.atbmarket.com;Initial Catalog=UZDLog;user id=usernamedb;Trusted_Connection=false;TrustServerCertificate=true;password=userpassworddb;"	|
+				
+				.AppSettings.OpenIdConnect.Authority = "https://uamtt2.atbmarket.com/adfs"   |
+				.AppSettings.OpenIdConnect.Issuer = "https://uamtt2.atbmarket.com/adfs/services/trust"   |
+				.AppSettings.OpenIdConnect.ClientId = "8df0b148-88b6-47dc-bcde-edcd6fd5a737"    |
+				
+				.ReportServiceConfig.Url = "https://tz-shop-app.atbmarket.com/UZDReporting"   |
+				
+				.PathBase = "/UzdPortal"     |
+				
+				.SystemConfigStorage.SystemCode = "PORTALUZD_Test"     |
+				
+				.AppSettings.Services.EttnWebService = "https://pre-shop-app.atbmarket.com/UzdPortalApiETTN/"   |
+				.AppSettings.Services.EdiWebService = "https://pre-shop-app.atbmarket.com/UzdPortalApiEDI/"   |
+				.AppSettings.Services.SignWebService = "https://pre-shop-app.atbmarket.com/UzdPortalApiSWS/"   
+												
+				' > ${file_AppSettings}.temp && mv ${file_AppSettings}.temp ${file_AppSettings}
+				"""		
+				sh "sed -i 's/usernamedb/${userdbname}/'  ${file_AppSettings}"
+				sh "sed -i 's/userpassworddb/${userdbpass}/'  ${file_AppSettings}"
+				}				
+			}
+		}
+		
+		stage("Сборка проекта в Docker контейнере") {
+            agent {label "tt-docker-build"}
+			steps {		
+				writeFile file: "src/Dockerfile", text: """
+				FROM tt-docker-build.atbmarket.com:80/atb_eis/eis-dotnet6-runtime:latest AS base
+
+				FROM tt-docker-build.atbmarket.com:80/atb_eis/eis-dotnet6-sdk:latest AS build
+				WORKDIR /src
+				COPY . .
+				RUN dotnet restore "${PathProjectForBuild}" --source http://rbs-app/NuGetServer/nuget --source https://api.nuget.org/v3/index.json
+				RUN dotnet build "${PathProjectForBuild}" -c ${ASPENV} -o /src/build
+
+				FROM build AS publish
+				RUN dotnet publish "${PathProjectForBuild}" -c ${ASPENV} -o /app/publish
+
+				FROM base AS final
+				WORKDIR /app
+				ADD ${root_cert_name} /usr/local/share/ca-certificates/${root_cert_name}
+				RUN update-ca-certificates
+				ADD ${CertFileNameCluster} .
+				COPY --from=publish /app/publish .
+
+				ENTRYPOINT ["dotnet", "${AppDll}"]
+								"""
+								sh """
+								cp certs/${root_cert_name} src/${root_cert_name}
+								cp certs/${CertFileNameCluster} src/${CertFileNameCluster}
+								cd src
+								docker login -u ${RepositoryLogin} -p ${RepositoryPass} ${RepositoryPath}
+								docker pull tt-docker-build.atbmarket.com:80/atb_eis/eis-dotnet6-sdk:latest
+								docker pull tt-docker-build.atbmarket.com:80/atb_eis/eis-dotnet6-runtime:latest
+								docker build --rm -t web/${ServiceName} . -f Dockerfile
+								docker tag web/${ServiceName} ${NewImageTag}:${BUILD_NUMBER}
+								docker push ${NewImageTag}:${BUILD_NUMBER}
+								docker rmi ${NewImageTag}:${BUILD_NUMBER}
+								docker rmi web/${ServiceName}
+								"""
+							}
+						}
+
+		stage("Запуск сервиса в docker swarm кластере") {
+			agent {label 'tt-swarm-test'}
+			steps {
+				deploy_service()
+			}					        
+		}
+	}
+	
+	post ('Отправка письма'){
+		always {
+			emailext (
+			to: 'BoykoAI@atbmarket.com;', 
+			subject: '${DEFAULT_SUBJECT}',
+			body: '$DEFAULT_CONTENT',
+			mimeType: 'text/html',
+			attachLog: true,
+			compressLog: true );
+		}
+	}
+}
